@@ -8,7 +8,7 @@ shell = os.environ["SHELL"]
 
 class Table:
 	def __init__(self, cols):
-		self.cols = [[fieldname, len(colname), [colname, ""]] for colname, fieldname in cols]
+		self.cols = [[fieldname, len(colname), [colname]] for colname, fieldname in cols]
 
 	def add(self, o):
 		for c in self.cols:
@@ -17,16 +17,29 @@ class Table:
 			c[2].append(v)
 	
 	def print(self):
-		i = 0
-		while True:
-			line = ""
+		def printline(i):
+			line = "\u2502"
 			try:
 				for c in self.cols:
-					line += c[2][i].ljust(c[1]) + ' | '
+					line += c[2][i].ljust(c[1]) + '\u2502'
 			except:
-				break
-			print(line[:-3])
+				return False
+			print(line[:-1] + '\u2502')
+			return False
+
+		def printsep(left, middle, right):
+			line = left
+			for c in self.cols:
+				line += "\u2500" * c[1] + middle
+			print(line[:-1] + right)
+
+		printsep('\u250c', '\u252c', '\u2510')
+		printline(0)
+		printsep('\u251c', '\u253c', '\u2524')
+		i = 1
+		while printline(i):
 			i += 1
+		printsep('\u2514', '\u2534', '\u2518')
 
 class TMUXSession:
 	def __init__(self, **kwargs):

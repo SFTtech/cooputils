@@ -25,7 +25,7 @@ class Table:
 			except:
 				return False
 			print(line[:-1] + '\u2502')
-			return False
+			return True
 
 		def printsep(left, middle, right):
 			line = left

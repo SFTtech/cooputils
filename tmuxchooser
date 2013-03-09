@@ -1,4 +1,9 @@
 #!/usr/bin/python3
+#
+# (c) 2013 by Michael Enßlin	<michael@ensslin.cc>
+#
+# GPLv3 or higher, no warranty, blabla
+
 import subprocess
 import re
 import os
@@ -122,8 +127,10 @@ while True:
 	try:
 		line = input("Session: ")
 	except EOFError:
+		print("")
 		break
 	except KeyboardInterrupt:
+		print("")
 		break
 	if len(line) == 0:
 		print("Spawning shell")

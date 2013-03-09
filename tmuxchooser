@@ -46,7 +46,7 @@ class TMUXSession:
 		self.__dict__.update(kwargs)
 
 def tmux_get_sessions():
-	proc=subprocess.Popen(["tmux", "list-sessions"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	proc=subprocess.Popen([tmux, "list-sessions"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 	sessions = []
 	expr = re.compile(b'([^:]+): [0-9]+ windows \(created ([^)]+)\) \[([0-9]+)x([0-9]+)\]')
 	for line in  proc.stdout.readlines():

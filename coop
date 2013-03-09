@@ -1,0 +1,2 @@
+#!/bin/sh
+sudo -u coop /usr/local/bin/tmuxchooser

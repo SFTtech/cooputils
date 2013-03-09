@@ -1,0 +1,126 @@
+#!/usr/bin/python3
+import subprocess
+import re
+import os
+
+tmux = "/usr/bin/tmux"
+shell = os.environ["SHELL"]
+
+class Table:
+	def __init__(self, cols):
+		self.cols = [[fieldname, len(colname), [colname, ""]] for colname, fieldname in cols]
+
+	def add(self, o):
+		for c in self.cols:
+			v = o.__dict__[c[0]].decode('utf-8')
+			c[1] = max(c[1], len(v))
+			c[2].append(v)
+	
+	def print(self):
+		i = 0
+		while True:
+			line = ""
+			try:
+				for c in self.cols:
+					line += c[2][i].ljust(c[1]) + ' | '
+			except:
+				break
+			print(line[:-3])
+			i += 1
+
+class TMUXSession:
+	def __init__(self, **kwargs):
+		self.__dict__.update(kwargs)
+
+def tmux_get_sessions():
+	proc=subprocess.Popen(["tmux", "list-sessions"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	sessions = []
+	expr = re.compile(b'([^:]+): [0-9]+ windows \(created ([^)]+)\) \[([0-9]+)x([0-9]+)\]')
+	for line in  proc.stdout.readlines():
+		match = expr.match(line)
+		if match == None:
+			raise Exception("Line " + line + " does not match regex")
+		groups = match.groups()
+		sessions.append(TMUXSession(
+			name = groups[0],
+			date = groups[1],
+			w = groups[2],
+			h = groups[3]
+		))
+	
+	errlines = proc.stderr.read().decode('utf-8')
+	if proc.wait() != 0:
+		raise Exception(errlines)
+
+	return sessions
+
+def tmux_attach_session(name):
+	return subprocess.call([tmux, "attach-session", "-t", name]) == 0
+
+def tmux_create_session(name):
+	return subprocess.call([tmux, "new-session", "-s", name]) == 0
+
+class Completer:
+	def __init__(self, sessions):
+		self.sessions = [s.name.decode('utf-8') for s in sessions]
+
+	def __call__(self, text, status):
+		if status == 0:
+			self.available = [s for s in self.sessions if s.startswith(text)]
+
+		try:
+			return self.available[status]
+		except:
+			return None
+
+import readline
+readline.parse_and_bind("tab: complete")
+
+while True:
+	#prompt the user which session he wishes to attach to.
+	#for that, we first need to know which sessions are running
+	try:
+		sessions = tmux_get_sessions()
+		errormsg = None
+	except Exception as e:
+		sessions = []
+		errormsg = e.args[0]
+
+	readline.set_completer(Completer(sessions))
+
+	print("Running TMUX sessions:\n")
+	if len(sessions) == 0:
+		if errormsg != None:
+			print("None: " + errormsg)
+		else:
+			print("None\n")
+	else:
+		t = Table([
+			("name", "name"),
+			("w", "w"),
+			("h", "h"),
+			("launch date", "date")])
+
+		for session in sessions:
+			t.add(session)
+		t.print()
+		print("")
+
+	try:
+		line = input("Session: ")
+	except EOFError:
+		break
+	except KeyboardInterrupt:
+		break
+	if len(line) == 0:
+		print("Spawning shell")
+		subprocess.call([shell])
+		continue
+
+	session = line.encode('utf-8')
+	if session in (s.name for s in sessions):
+		if not tmux_attach_session(session):
+			print("Could not attach to session " + session.decode('utf-8'))
+	else:
+		if not tmux_create_session(session):
+			print("Could not create session " + session.decode('utf-8'))

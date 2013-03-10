@@ -121,9 +121,6 @@ class Table:
 
 	def print(self):
 		def printrow(r):
-			if r >= len(self.rows.h):
-				return False
-
 			h = self.rows.h[r]
 			for i in range(0, h):
 				line = "\u2502"
@@ -163,8 +160,6 @@ class Table:
 					line += text + '\u2502'
 
 				print(line[:-1] + '\u2502')
-
-			return True
 
 		def printsep(left, middle, right):
 			line = left
@@ -222,10 +217,9 @@ class Table:
 
 		printsep('\u250c', '\u252c', '\u2510')
 		printrow(0)
-		printsep('\u251c', '\u253c', '\u2524')
-		i = 1
-		while printrow(i):
-			i += 1
+		for i in range(1, len(self.rows.h)):
+			printsep('\u251c', '\u253c', '\u2524')
+			printrow(i)
 		printsep('\u2514', '\u2534', '\u2518')
 
 class Storage:
@@ -276,6 +270,7 @@ class Proc:
 def ps():
 	procs = collections.OrderedDict()
 
+	#collect information for all processes
 	for f in os.listdir("/proc"):
 		try:
 			pid = int(f)
@@ -283,10 +278,13 @@ def ps():
 		except:
 			pass
 
+	#construct tree. (we don't need it here, but mit might be useful at some later point)
 	for pid in procs:
 		proc = procs[pid]
 		try:
-			procs[proc.ppid].children.append(proc)
+			parproc = procs[proc.ppid]
+			proc.parent = parproc
+			parproc.children.append(proc)
 		except:
 			pass
 	
@@ -343,7 +341,7 @@ def tmux_get_sessions():
 	for client in tmux_get("list-clients", ["session_name", "client_activity", "client_tty", "client_width", "client_height"]):
 		s = sessions[client.session_name]
 		#the user name is the owner of the pts
-		uname = pwd.getpwuid(os.stat("/dev/pts/0").st_uid).pw_name
+		uname = pwd.getpwuid(os.stat(client.client_tty).st_uid).pw_name
 		activity = int(client.client_activity)
 		w = int(client.client_width)
 		h = int(client.client_height)
@@ -427,7 +425,7 @@ while True:
 	for session in sessions:
 		t.add_row(session)
 	t.print()
-	print("\nType the name of an existing or new session.\nPress ENTER to spawn a shell.")
+	print("\nType the name of an existing or new session, or press ENTER to spawn a shell.")
 
 	#query the user for 
 	try:

@@ -5,72 +5,371 @@
 # GPLv3 or higher, no warranty, blabla
 
 import subprocess
-import re
 import os
+import pwd
+import collections
+import time
 
 tmux = "/usr/bin/tmux"
 shell = os.environ["SHELL"]
 
-class Table:
-	def __init__(self, cols):
-		self.cols = [[fieldname, len(colname), [colname]] for colname, fieldname in cols]
+class EnumVal:
+	def __init__(self, name):
+		self.name = name
+	def __repr__(self):
+		return repr(self.name)
 
-	def add(self, o):
-		for c in self.cols:
-			v = o.__dict__[c[0]].decode('utf-8')
-			c[1] = max(c[1], len(v))
-			c[2].append(v)
+def ttywidth(fd = 1):
+	import fcntl, termios, struct
+	try:
+		h, w, hp, wp = struct.unpack('HHHH', fcntl.ioctl(fd, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0)))
+		return w
+	except:
+		return float("+inf")
+
+class Table:
+	align_left = EnumVal("align left")
+	align_center = EnumVal("align center")
+	align_right = EnumVal("align right")
+
+	def __init__(self, minrowh = 1, maxrowh = float("+inf")):
+		self.rows = Storage(minh = minrowh, maxh = maxrowh, h = [minrowh])
+		self.cols = []
 	
+	def add_col(self, colname, *srcs, minw = 0, maxw = float("+inf")):
+		if len(srcs) == 0:
+			srcs = [colname]
+
+		#converts all source types to a object-dependent function
+		def src_to_fun(src):
+			if src == None:
+				return lambda o: ""
+			elif type(src) == str:
+				return lambda o: o.__dict__[src]
+			else:
+				return src
+
+		#store the column
+		col = Storage(
+			srcs = [src_to_fun(src) for src in srcs],
+			w = minw,
+			minw = minw,
+			maxw = maxw,
+			vals = []
+		)
+		self.cols.append(col)
+
+		#store the colname as the first value
+		colnameheight = self._col_add_val(col, (colname, Table.align_center))
+
+		#if there are already rows in the table, fill them with empty strings
+		for i in range(1, len(self.rows.h)):
+			self._col_add_val(col, "")
+
+		#adapt the height of the first row
+		self.rows.h[0] = max(self.rows.h[0], colnameheight)
+
+	
+	def add_row(self, o):
+		rowh = self.rows.minh
+		for col in self.cols:
+			#get the val with the first src function that does not fail
+			v = None
+			errors = ""
+			for src in col.srcs:
+				try:
+					v = src(o)
+					break
+				except Exception as e:
+					errors += '\n' + repr(e)
+					pass
+			if v == None:
+				#none of the src functions worked
+				raise Exception("Could not generate valid data for field " + str(col.vals[0]) + ":" + errors)
+
+			valh = self._col_add_val(col, v)
+			rowh = max(rowh, valh)
+		self.rows.h.append(rowh)
+
+	#returns the height of the value in lines
+	def _col_add_val(self, col, v):
+		#convert v to a list, if it contains only a single value
+		#that could be a string, or a (string, alignment) tuple.
+		if type(v) == str:
+			v = v.split('\n')
+		if type(v) == tuple:
+			v = [v]
+		#try to catch generic other cases, such as generators or sets
+		if type(v) != list:
+			v = list(v)
+
+		#check if w is too high
+		if len(v) > self.rows.maxh:
+			v = v[0:self.rows.maxh - 1] + [('...', Table.align_left)]
+
+		#make sure every list entry is a (str, alignment) tuple
+		v = [type(l) == tuple and l or (l, Table.align_left) for l in v]
+
+		#get max width. note that wlimit will be enforced at printing time,
+		#when alignment is done
+		col.w = max([col.w] + [len(s[0]) for s in v])
+
+		#finally, append the value to the col
+		col.vals.append(v)
+
+		return len(v)
+
 	def print(self):
-		def printline(i):
-			line = "\u2502"
-			try:
-				for c in self.cols:
-					line += c[2][i].ljust(c[1]) + '\u2502'
-			except:
+		def printrow(r):
+			if r >= len(self.rows.h):
 				return False
-			print(line[:-1] + '\u2502')
+
+			h = self.rows.h[r]
+			for i in range(0, h):
+				line = "\u2502"
+				for col in self.cols:
+					try:
+						text, alignment = col.vals[r][i]
+					except:
+						#if this value does not have the full height of the row,
+						#fill it with "", alignment_left
+						text, alignment = "", Table.align_left
+
+					#TODO use colorcode-sensitive length determination here
+					textlen = len(text)
+
+					filler = " "
+					overflow = "..."
+					free = col.w - textlen
+					if free < 0:
+						if col.w <= 3:
+							text = overflow[0:col.w]
+						else:
+							text = text[0:col.w - len(overflow)] + overflow
+					elif free == 0:
+						pass
+					elif alignment == Table.align_left:
+						text = text + filler * free
+					elif alignment == Table.align_center:
+						halffree = free // 2
+						text = filler * halffree + text + filler * halffree
+						if halffree * 2 < free:
+							text += filler
+					elif alignment == Table.align_right:
+						text = filler * free + text
+					else:
+						raise Exception("Unknown text alignment: " + repr(alignment))
+
+					line += text + '\u2502'
+
+				print(line[:-1] + '\u2502')
+
 			return True
 
 		def printsep(left, middle, right):
 			line = left
-			for c in self.cols:
-				line += "\u2500" * c[1] + middle
+			for col in self.cols:
+				line += "\u2500" * col.w + middle
 			print(line[:-1] + right)
 
+		#calculate free width
+		freespace = ttywidth()
+		colspace = 0
+		shrinkablespace = 0
+
+		for col in self.cols:
+			#limit col width to its own max
+			col.w = min(col.w, col.maxw)
+			colspace += col.w
+			shrinkablespace += col.w - col.minw
+
+		#we might additionally need to shrink the columns if the whole table is wider than the tty
+		if freespace < 1 + len(self.cols) + colspace:
+			needed = colspace + 1 + len(self.cols) - freespace
+			if shrinkablespace >= needed:
+				#we need to shrink the shrinkable colspace by 'needed' characters
+				factor = 1 - (needed / shrinkablespace)
+
+				import math
+				for col in self.cols:
+					newwf = col.minw + (col.w - col.minw) * factor
+					neww = math.ceil(newwf)
+					#the lower the fraction, the more easily we could sacrifice an aditional
+					#character in this col
+					col.fraction = newwf - neww
+					needed -= (col.w - neww)
+					col.w = neww
+
+				while needed > 0:
+					c = None
+					for col in self.cols:
+						if col.w > col.minw:
+							if c == None:
+								c = col
+							elif col.fraction < c.fraction:
+								c = col
+
+					if c == None:
+						#this should not happen
+						break
+
+					c.w -= 1
+					needed -= 1
+					c.fraction = 1
+			else:
+				#we can not shrink the table enough. print it anyway
+				pass
+
 		printsep('\u250c', '\u252c', '\u2510')
-		printline(0)
+		printrow(0)
 		printsep('\u251c', '\u253c', '\u2524')
 		i = 1
-		while printline(i):
+		while printrow(i):
 			i += 1
 		printsep('\u2514', '\u2534', '\u2518')
 
-class TMUXSession:
+class Storage:
 	def __init__(self, **kwargs):
 		self.__dict__.update(kwargs)
 
-def tmux_get_sessions():
-	proc=subprocess.Popen([tmux, "list-sessions"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-	sessions = []
-	expr = re.compile(b'([^:]+): [0-9]+ windows \(created ([^)]+)\) \[([0-9]+)x([0-9]+)\]')
-	for line in  proc.stdout.readlines():
-		match = expr.match(line)
-		if match == None:
-			raise Exception("Line " + line + " does not match regex")
-		groups = match.groups()
-		sessions.append(TMUXSession(
-			name = groups[0],
-			date = groups[1],
-			w = groups[2],
-			h = groups[3]
-		))
-	
-	errlines = proc.stderr.read().decode('utf-8')
-	if proc.wait() != 0:
-		raise Exception(errlines)
+class Proc:
+	def __init__(self, pid):
+		self.pid = pid
+		self.children = [] 
 
-	return sessions
+		#read stats from /proc/
+		f = open("/proc/" + str(pid) + "/stat")
+		statstr = f.read()
+		f.close()
+		[lm, r] = statstr.rsplit(')', 1)
+		[l, m] = lm.split('(', 1)
+		stats = l.strip().split(' ') + [m] + r.strip().split(' ')
+
+		#for field numbers, see man 5 proc
+		self.ppid = int(stats[3])
+		self.execname = stats[1]
+		self.fgpg = int(stats[7])
+		self.pg = int(stats[4])
+
+		f = open("/proc/" + str(pid) + "/cmdline")
+		self.argv = f.read().split('\0')
+		f.close()
+
+		self.cmdline = ""
+		for arg in self.argv:
+			self.cmdline += arg + " "
+		self.cmdline = self.cmdline[:-1]
+
+	def all_children(self):
+		result = {self}
+		for chld in self.children:
+			result.update(chld.all_children())
+		return result
+
+	def __repr__(self, indent = 0):
+		result = ' ' * indent + self.execname +  "(" + str(self.pid) + ")"
+		for chld in self.children:
+			for line in chld.__repr__().split('\n'):
+				result += "\n    " + line
+		return result
+
+def ps():
+	procs = collections.OrderedDict()
+
+	for f in os.listdir("/proc"):
+		try:
+			pid = int(f)
+			procs[pid] = Proc(pid)
+		except:
+			pass
+
+	for pid in procs:
+		proc = procs[pid]
+		try:
+			procs[proc.ppid].children.append(proc)
+		except:
+			pass
+	
+	return procs
+
+def popen(args):
+	proc = subprocess.Popen(args, stdout = subprocess.PIPE, stderr = subprocess.PIPE)
+	if proc.wait() != 0:
+		raise Exception(proc.stderr.read().decode('utf-8'))
+	return proc.stdout.read()
+
+def tmux_get(command, fields):
+	fstring = ""
+	for field in fields:
+		fstring += "#{" + field + "}\n"
+
+	for item in popen([tmux] + command.split(' ') + ["-F", fstring]).decode('utf-8').split("\n\n"):
+		if item == "":
+			return
+		item = item.split('\n')
+		s = Storage()
+		for i in range(0, len(fields)):
+			s.__dict__[fields[i]] = item[i] 
+		yield s
+
+def tmux_get_sessions():
+	procs = ps()
+
+	sessions = {}
+	for session in tmux_get("list-sessions", ["session_name", "session_created", "session_width", "session_height"]):
+		s = Storage(name = session.session_name)
+		s.created = int(session.session_created)
+		s.w = int(session.session_width)
+		s.h = int(session.session_height)
+		s.dims = session.session_width + "x" + session.session_height
+		s.fgprocs = []
+		s.users = dict()
+		s.usr_blame_w = None
+		s.usr_blame_h = None
+		s.usr_most_recent = None
+		sessions[s.name] = s
+	
+	for pane in tmux_get("list-panes -a", ["session_name", "pane_pid"]):
+		s = sessions[pane.session_name]
+		pid = int(pane.pane_pid)
+		try:
+			fgpg = procs[pid].fgpg
+			for pid in procs:
+				if procs[pid].pg == fgpg:
+					s.fgprocs.append(procs[pid])
+		except:
+			pass
+	
+	for client in tmux_get("list-clients", ["session_name", "client_activity", "client_tty", "client_width", "client_height"]):
+		s = sessions[client.session_name]
+		#the user name is the owner of the pts
+		uname = pwd.getpwuid(os.stat("/dev/pts/0").st_uid).pw_name
+		activity = int(client.client_activity)
+		w = int(client.client_width)
+		h = int(client.client_height)
+		if not uname in s.users:
+			usr = Storage()
+			usr.w = w
+			usr.h = h
+			usr.activity = activity
+			s.users[uname] = usr
+		else:
+			usr = s.users[uname]
+			usr.w = min(w, usr.w)
+			usr.h = min(h, usr.h)
+			usr.activity = max(activity, usr.activity)
+		#check which user is to blame for the terminal size constraints, and who was most recently active
+		if usr.w == s.w:
+			s.usr_blame_w = usr
+		if usr.h == s.h:
+			s.usr_blame_h = usr
+		if s.usr_most_recent == None:
+			s.usr_most_recent = usr
+		else:
+			if usr.activity > s.usr_most_recent.activity:
+				s.usr_most_recent = usr
+
+	return [sessions[session] for session in sessions]
 
 def tmux_attach_session(name):
 	return subprocess.call([tmux, "attach-session", "-t", name]) == 0
@@ -80,7 +379,7 @@ def tmux_create_session(name):
 
 class Completer:
 	def __init__(self, sessions):
-		self.sessions = [s.name.decode('utf-8') for s in sessions]
+		self.sessions = [s.name for s in sessions]
 
 	def __call__(self, text, status):
 		if status == 0:
@@ -91,41 +390,48 @@ class Completer:
 		except:
 			return None
 
+def date_to_str(d):
+	t = round(time.time())
+	localtime = time.localtime(d)
+	dt = t - d
+	if dt < 10:
+		return "just now"
+	elif dt < 60:
+		return "last min"
+	elif dt < (3600 * 12):
+		return time.strftime("%H:%M", localtime)
+	else:
+		return time.strftime("%Y-%m-%d %H:%M", localtime)
+
 import readline
 readline.parse_and_bind("tab: complete")
 
 while True:
-	#prompt the user which session he wishes to attach to.
-	#for that, we first need to know which sessions are running
+	#gather information about running sessions
 	try:
 		sessions = tmux_get_sessions()
-		errormsg = None
-	except Exception as e:
+	except:
 		sessions = []
-		errormsg = e.args[0]
 
 	readline.set_completer(Completer(sessions))
 
+	#display the gathered information
 	print("Running TMUX sessions:\n")
-	if len(sessions) == 0:
-		if errormsg != None:
-			print("None: " + errormsg)
-		else:
-			print("None\n")
-	else:
-		t = Table([
-			("name", "name"),
-			("w", "w"),
-			("h", "h"),
-			("launch date", "date")])
+	t = Table(minrowh = 1, maxrowh = 10)
+	t.add_col("name", minw = 10)
+	t.add_col("dims", lambda session: (session.dims, Table.align_right), minw = 6)
+	t.add_col("created", lambda session: (date_to_str(session.created), Table.align_right), minw = 16)
+	t.add_col("last active", lambda session: (date_to_str(session.usr_most_recent.activity), Table.align_right), None, minw = 16)
+	t.add_col("users", lambda session: ((x, Table.align_right) for x in sorted(session.users, key=lambda x: -session.users[x].activity)), minw = 8)
+	t.add_col("fg processes", lambda session: [p.cmdline for p in session.fgprocs])
+	for session in sessions:
+		t.add_row(session)
+	t.print()
+	print("\nType the name of an existing or new session.\nPress ENTER to spawn a shell.")
 
-		for session in sessions:
-			t.add(session)
-		t.print()
-		print("")
-
+	#query the user for 
 	try:
-		line = input("Session: ")
+		line = input("> ")
 	except EOFError:
 		print("")
 		break
@@ -137,10 +443,9 @@ while True:
 		subprocess.call([shell])
 		continue
 
-	session = line.encode('utf-8')
-	if session in (s.name for s in sessions):
-		if not tmux_attach_session(session):
-			print("Could not attach to session " + session.decode('utf-8'))
+	if line in (s.name for s in sessions):
+		if not tmux_attach_session(line):
+			print("Could not attach to session " + line)
 	else:
-		if not tmux_create_session(session):
-			print("Could not create session " + session.decode('utf-8'))
+		if not tmux_create_session(line):
+			print("Could not create session " + line)

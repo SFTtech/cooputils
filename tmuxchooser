@@ -1,17 +1,34 @@
 #!/usr/bin/env python3
+"""
+Shows a list of running tmux sessions with metadata, and allows you to connect
+to any running session or create a new one.
+
+Much shiny, very tab completion.
+
+Such Copyright 2013-2014 Michael Ensslin. Wow. GPLv3+.
+"""
 
 import subprocess
 import os
 import pwd
 import collections
 import time
-inf = float("+inf")
+from collections import namedtuple
+from types import SimpleNamespace
+import shlex
 
-tmux = "/usr/bin/tmux"
-shell = os.environ["SHELL"]
+INF = float("+inf")
+TMUX = "/usr/bin/tmux"
+SHELL = os.environ["SHELL"]
 
 
 class EnumVal:
+    """
+    simple named object; designed for use as an enum value.
+
+    e.g.: A = EnumVal('A'); B = EnumVal('B'); f(A)
+    """
+    # pylint: disable=too-few-public-methods
     def __init__(self, name):
         self.name = name
 
@@ -19,431 +36,632 @@ class EnumVal:
         return repr(self.name)
 
 
-def ttywidth(fd=1):
+def ttywidth(fileno=1):
+    """
+    Determines the width of the terminal at the given tty file descriptor.
+
+    Returns infinity for non-terminal fds.
+    """
     import fcntl
     import termios
     import struct
     try:
-        h, w, _, _ = struct.unpack('HHHH', fcntl.ioctl(fd, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0)))
-        return w
-    except:
-        return inf
+        packed_input = struct.pack('HHHH', 0, 0, 0, 0)
+        packed_output = fcntl.ioctl(fileno, termios.TIOCGWINSZ, packed_input)
+        _, width, _, _ = struct.unpack('HHHH', packed_output)
+        return width
+    except OSError:
+        return INF
+
+
+def colorcodesensitive_len(string):
+    """
+    Determines the printed length of a string, while ignoring control
+    characters and SGR (color) escape sequences.
+
+    Might fail horribly for strongs that contain escape sequences other than
+    SGR.
+    """
+    totallen = 0
+    inescseq = False
+
+    for char in string:
+        if not inescseq:
+            if ord(char) >= 0x20:
+                totallen += 1
+            elif char == '\x1b':
+                inescseq = True
+        else:
+            if 64 <= ord(char) < 127:
+                inescseq = False
+
+    return totallen
+
+
+ALIGN_LEFT = EnumVal("align left")
+ALIGN_CENTER = EnumVal("align center")
+ALIGN_RIGHT = EnumVal("align right")
+
+
+def align_string(string, alignment, width):
+    """
+    Aligns a single string to be exacty 'width' characters wide
+
+    @param alignment
+        one of ALIGN_LEFT, ALIGN_CENTER, ALIGN_RIGHT
+    """
+    length = colorcodesensitive_len(string)
+    free = width - length
+    if free < 0:
+        # we need to cut
+        overflow = "..."
+        if width <= len(overflow):
+            return overflow[:width]
+        else:
+            return string[:width - len(overflow)] + overflow
+
+    elif alignment == ALIGN_LEFT:
+        return string + " " * free
+
+    elif alignment == ALIGN_CENTER:
+        return " " * (free // 2) + string + " " * (free - free // 2)
+
+    elif alignment == ALIGN_RIGHT:
+        return " " * free + string
+
+    raise Exception("Unknown text alignment: " + str(alignment))
+
+
+class Column:
+    """
+    One column of a Table
+    """
+    def __init__(self, colname, *functors, minw=0, maxw=INF):
+        """
+        Creates a column.
+
+        @param colname:
+            The column's title
+        @param functors:
+            List of functions to extract column information from row objects.
+            Multiple argument types are allowed:
+                - single-arg functions that return the column information
+                - str (key for getattr)
+                - None (-> empty value)
+            All functors are attempted, until one returns non-None.
+            For allowed return values for the functors, see add_val.
+        @param minw:
+            Minimum column width. The column will have an automatic size,
+            but will always be at least minw chars wide.
+        @param maxw:
+            Maximum column width. Guess what.
+        """
+        self.name = colname
+        self.width = minw
+        self.minw = minw
+        self.maxw = maxw
+        self.vals = []
+
+        # process functors
+        if not functors:
+            functors = [colname]
+
+        def normalize_functor(functor):
+            """
+            converts all allowed values of 'functor' to a callable function
+            """
+            if functor is None:
+                return lambda o: ""
+            elif isinstance(functor, str):
+                return lambda o: getattr(o, functor)
+            elif callable(functor):
+                return functor
+            else:
+                raise TypeError("functor has invalid type: " + repr(functor))
+
+        self.functors = [normalize_functor(functor) for functor in functors]
+
+        # pointer back to owner table
+        self.table = None
+
+    def add_val(self, val):
+        """
+        Adds a value to a column.
+
+        @val:
+            The value object, as returned by a functor.
+
+            Allowed types are:
+             - str (newlines separate lines)
+             - tuple of (string, alignment)
+             - list/generator, containing one such tuple per element
+
+            Single lines must be of type str.
+        """
+        val = self._normalize_val(val)
+
+        # update own width.
+        # wlimit is enforced at printing time, when alignment is done.
+        self.width = max([self.width] + [len(s[0]) for s in val])
+
+        # append the val to the col
+        self.vals.append(val)
+
+    def _normalize_val(self, val):
+        """
+        Normalizes val to a list of (line, alignment) tuples.
+        """
+        # convert v to a list, if it contains only a single val
+        # that could be a string, or a (string, alignment) tuple.
+        if isinstance(val, str):
+            val = val.split('\n')
+        elif isinstance(val, tuple):
+            val = [val]
+        else:
+            val = list(val)
+
+        if len(val) > self.table.maxrowh:
+            # val has too many lines; crop and add '...' at end
+            val = val[0:self.table.maxrowh - 1] + [('...', ALIGN_LEFT)]
+
+        # add alignment to list entries
+        return [l if isinstance(l, tuple) else (l, ALIGN_LEFT) for l in val]
+
+    def _get_val(self, rowobj):
+        """
+        Calculates the field value from rowobj using colval.
+        """
+        for functor in self.functors:
+            val = functor(rowobj)
+            if val is not None:
+                return val
+
+        # none of the functors worked
+        raise Exception("Could not generate valid data for field " + self.name)
+
+    def add_obj(self, rowobj):
+        """
+        Adds the row object to the column.
+        """
+        self.add_val(self._get_val(rowobj))
 
 
 class Table:
-    align_left = EnumVal("align left")
-    align_center = EnumVal("align center")
-    align_right = EnumVal("align right")
+    """
+    Pretty-printer for tables
+    """
+    def __init__(self, minrowh=1, maxrowh=INF):
+        self.minrowh = minrowh
+        self.maxrowh = maxrowh
 
-    def __init__(self, minrowh=1, maxrowh=inf):
-        self.rows = Storage(minh=minrowh, maxh=maxrowh, h=[minrowh])
+        # stores the row objects for all but the title row
+        self.rowobjs = []
+
         self.cols = []
 
-    def add_col(self, colname, *srcs, minw=0, maxw=inf):
-        if len(srcs) == 0:
-            srcs = [colname]
-
-        # converts all source types to a object-dependent function
-        def src_to_fun(src):
-            if src is None:
-                return lambda o: ""
-            elif type(src) == str:
-                return lambda o: o.__dict__[src]
-            else:
-                return src
-
-        # store the column
-        col = Storage(
-            srcs=[src_to_fun(src) for src in srcs],
-            w=minw,
-            minw=minw,
-            maxw=maxw,
-            vals=[]
-        )
+    def add_col(self, col):
+        """
+        Adds a table column.
+        """
+        col.table = self
         self.cols.append(col)
 
         # store the colname as the first value
-        colnameheight = self._col_add_val(col, (colname, Table.align_center))
+        col.add_val((col.name, ALIGN_CENTER))
 
-        # if there are already rows in the table, fill them with empty strings
-        for i in range(1, len(self.rows.h)):
-            self._col_add_val(col, "")
+        # catch up on all already-existing row objects
+        for rowobj in self.rowobjs:
+            col.add_obj(rowobj)
 
-        # adapt the height of the first row
-        self.rows.h[0] = max(self.rows.h[0], colnameheight)
-
-    def add_row(self, o):
-        rowh = self.rows.minh
+    def add_row(self, rowobj):
+        """
+        Adds a row to the table, using rowobj as content source.
+        """
+        self.rowobjs.append(rowobj)
         for col in self.cols:
-            # get the val with the first src function that does not fail
-            v = None
-            errors = ""
-            for src in col.srcs:
-                try:
-                    v = src(o)
-                    break
-                except Exception as e:
-                    errors += '\n' + repr(e)
-                    pass
-            if v is None:
-                # none of the src functions worked
-                raise Exception("Could not generate valid data for field " + str(col.vals[0]) + ":" + errors)
+            col.add_obj(rowobj)
 
-            valh = self._col_add_val(col, v)
-            rowh = max(rowh, valh)
-        self.rows.h.append(rowh)
+    def print_row(self, rowid):
+        """
+        Pretty-prints row #row of the table.
+        """
+        rowheight = max(len(col.vals[rowid]) for col in self.cols)
 
-    # returns the height of the value in lines
-    def _col_add_val(self, col, v):
-        # convert v to a list, if it contains only a single value
-        # that could be a string, or a (string, alignment) tuple.
-        if type(v) == str:
-            v = v.split('\n')
-        if type(v) == tuple:
-            v = [v]
-        # try to catch generic other cases, such as generators or sets
-        if type(v) != list:
-            v = list(v)
+        for i in range(rowheight):
+            self.print_rowline(rowid, i)
 
-        # check if w is too high
-        if len(v) > self.rows.maxh:
-            v = v[0:self.rows.maxh - 1] + [('...', Table.align_left)]
+    def print_rowline(self, rowid, lineno):
+        """
+        Pretty-prints a single line of row #row.
+        """
+        fields = []
 
-        # make sure every list entry is a (str, alignment) tuple
-        v = [type(l) == tuple and l or (l, Table.align_left) for l in v]
+        for col in self.cols:
+            try:
+                text, alignment = col.vals[rowid][lineno]
+            except IndexError:
+                # vertical padding
+                text, alignment = "", ALIGN_LEFT
 
-        # get max width. note that wlimit will be enforced at printing time,
-        # when alignment is done
-        col.w = max([col.w] + [len(s[0]) for s in v])
+            fields.append(align_string(text, alignment, col.width))
 
-        # finally, append the value to the col
-        col.vals.append(v)
+        print("\u2502" + "\u2502".join(fields) + '\u2502')
 
-        return len(v)
+    def print_rowsep(self, left, middle, right):
+        """
+        Prints a row separator
+        """
+        print(
+            left +
+            middle.join("\u2500" * col.width for col in self.cols) +
+            right)
 
     def print(self):
-        def printrow(r):
-            h = self.rows.h[r]
-            for i in range(0, h):
-                line = "\u2502"
-                for col in self.cols:
-                    try:
-                        text, alignment = col.vals[r][i]
-                    except:
-                        # if this value does not have the full height of the row,
-                        # fill it with "", alignment_left
-                        text, alignment = "", Table.align_left
-
-                    # TODO use colorcode-sensitive length determination here
-                    textlen = len(text)
-
-                    filler = " "
-                    overflow = "..."
-                    free = col.w - textlen
-                    if free < 0:
-                        if col.w <= 3:
-                            text = overflow[0:col.w]
-                        else:
-                            text = text[0:col.w - len(overflow)] + overflow
-                    elif free == 0:
-                        pass
-                    elif alignment == Table.align_left:
-                        text = text + filler * free
-                    elif alignment == Table.align_center:
-                        halffree = free // 2
-                        text = filler * halffree + text + filler * halffree
-                        if halffree * 2 < free:
-                            text += filler
-                    elif alignment == Table.align_right:
-                        text = filler * free + text
-                    else:
-                        raise Exception("Unknown text alignment: " + repr(alignment))
-
-                    line += text + '\u2502'
-
-                print(line[:-1] + '\u2502')
-
-        def printsep(left, middle, right):
-            line = left
-            for col in self.cols:
-                line += "\u2500" * col.w + middle
-            print(line[:-1] + right)
-
-        # calculate free width
+        """
+        Pretty-prints the table.
+        """
+        # calculate column widths
         freespace = ttywidth()
         colspace = 0
         shrinkablespace = 0
 
         for col in self.cols:
             # limit col width to its own max
-            col.w = min(col.w, col.maxw)
-            colspace += col.w
-            shrinkablespace += col.w - col.minw
+            col.width = min(col.width, col.maxw)
+            colspace += col.width
+            shrinkablespace += col.width - col.minw
 
-        # we might additionally need to shrink the columns if the whole table is wider than the tty
+        # additional column-shrinking is necessary if the whole table is
+        # wider than the tty
         if freespace < 1 + len(self.cols) + colspace:
             needed = colspace + 1 + len(self.cols) - freespace
             if shrinkablespace >= needed:
-                # we need to shrink the shrinkable colspace by 'needed' characters
+                # we need to shrink the shrinkable colspace by 'needed' chars
                 factor = 1 - (needed / shrinkablespace)
 
                 import math
                 for col in self.cols:
-                    newwf = col.minw + (col.w - col.minw) * factor
+                    newwf = col.minw + (col.width - col.minw) * factor
                     neww = math.ceil(newwf)
-                    # the lower the fraction, the more easily we could sacrifice an aditional
-                    # character in this col
+                    # the lower the fraction, the more easily we could
+                    # sacrifice an aditional character in this col
                     col.fraction = newwf - neww
-                    needed -= (col.w - neww)
-                    col.w = neww
+                    needed -= (col.width - neww)
+                    col.width = neww
 
                 while needed > 0:
-                    c = None
+                    victim = None
                     for col in self.cols:
-                        if col.w > col.minw:
-                            if c is None:
-                                c = col
-                            elif col.fraction < c.fraction:
-                                c = col
+                        if col.width > col.minw:
+                            if victim is None:
+                                victim = col
+                            elif col.fraction < victim.fraction:
+                                victim = col
 
-                    if c is None:
-                        # this should not happen
+                    if victim is None:
+                        # shrinking has failed; we couldn't find a victim.
                         break
 
-                    c.w -= 1
+                    victim.width -= 1
                     needed -= 1
-                    c.fraction = 1
+                    victim.fraction = 1
             else:
                 # we can not shrink the table enough. print it anyway
                 pass
 
-        printsep('\u250c', '\u252c', '\u2510')
-        printrow(0)
-        for i in range(1, len(self.rows.h)):
-            printsep('\u251c', '\u253c', '\u2524')
-            printrow(i)
-        printsep('\u2514', '\u2534', '\u2518')
+        self.print_rowsep('\u250c', '\u252c', '\u2510')
+        self.print_row(0)
+        for i in range(1, len(self.rowobjs) + 1):
+            self.print_rowsep('\u251c', '\u253c', '\u2524')
+            self.print_row(i)
+        self.print_rowsep('\u2514', '\u2534', '\u2518')
 
 
-class Storage:
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
+ProcessInfo = namedtuple("ProcessInfo", ("ppid", "execname",
+                                         "fgpgroup", "pgroup", "cmdline"))
 
 
-class Proc:
-    def __init__(self, pid):
-        self.pid = pid
-        self.children = []
+def get_process_info(pid):
+    """
+    Retrieves info on one POSIX process.
+    """
+    # read stats from /proc/
+    with open("/proc/" + str(pid) + "/stat") as statfile:
+        statstr = statfile.read()
 
-        # read stats from /proc/
-        f = open("/proc/" + str(pid) + "/stat")
-        statstr = f.read()
-        f.close()
-        [lm, r] = statstr.rsplit(')', 1)
-        [l, m] = lm.split('(', 1)
-        stats = l.strip().split(' ') + [m] + r.strip().split(' ')
+    # parsing /proc/stat is horrible.
+    leftmiddle, right = statstr.rsplit(')', 1)
+    left, middle = leftmiddle.split('(', 1)
+    left = left.strip().split(' ')
+    middle = [middle]
+    right = right.strip().split(' ')
+    stats = left + middle + right
 
-        # for field numbers, see man 5 proc
-        self.ppid = int(stats[3])
-        self.execname = stats[1]
-        self.fgpg = int(stats[7])
-        self.pg = int(stats[4])
+    with open("/proc/" + str(pid) + "/cmdline") as cmdlinefile:
+        argv = cmdlinefile.read().split('\0')
+        if not argv[-1]:
+            argv.pop()
 
-        f = open("/proc/" + str(pid) + "/cmdline")
-        self.argv = f.read().split('\0')
-        f.close()
-
-        self.cmdline = ""
-        for arg in self.argv:
-            self.cmdline += arg + " "
-        self.cmdline = self.cmdline[:-1]
-
-    def all_children(self):
-        result = {self}
-        for chld in self.children:
-            result.update(chld.all_children())
-        return result
-
-    def __repr__(self, indent=0):
-        result = ' ' * indent + self.execname + "(" + str(self.pid) + ")"
-        for chld in self.children:
-            for line in chld.__repr__().split('\n'):
-                result += "\n    " + line
-        return result
+    # for field numbers, and why the above hat to be done, see man 5 proc
+    return ProcessInfo(
+        ppid=int(stats[3]),
+        execname=stats[1],
+        fgpgroup=int(stats[7]),
+        pgroup=int(stats[4]),
+        cmdline=" ".join(shlex.quote(arg) for arg in argv))
 
 
-def ps():
+def list_processes():
+    """
+    Collects information on every running process
+
+    @returns a dictionary of {pid: ProcessInfo}
+    """
     procs = collections.OrderedDict()
 
     # collect information for all processes
-    for f in os.listdir("/proc"):
+    for pidstring in os.listdir("/proc"):
         try:
-            pid = int(f)
-            procs[pid] = Proc(pid)
-        except:
+            pid = int(pidstring)
+            procs[pid] = get_process_info(pid)
+        except ValueError:
             pass
-
-    # construct tree. (we don't need it here, but mit might be useful at some later point)
-    for pid in procs:
-        proc = procs[pid]
-        try:
-            parproc = procs[proc.ppid]
-            proc.parent = parproc
-            parproc.children.append(proc)
-        except:
+        except FileNotFoundError:
             pass
 
     return procs
 
 
 def popen(args):
-    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    """
+    Runs the given process and returns its stdout.
+
+    @param args:
+        process argv
+    """
+    proc = subprocess.Popen(args,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
     if proc.wait() != 0:
-        raise Exception(proc.stderr.read().decode('utf-8'))
-    return proc.stdout.read()
+        raise RuntimeError(proc.stderr.read().decode('utf-8'))
+    return proc.stdout.read().decode('utf-8', errors='replace')
 
 
 def tmux_get(command, fields):
+    """
+    Queries tmux with the given command, returning a named tuple of 'fields'.
+
+    @param command:
+        str consisting of whitespace-joined argv[1:].
+    """
     fstring = ""
     for field in fields:
         fstring += "#{" + field + "}\n"
 
-    for item in popen([tmux] + command.split(' ') + ["-F", fstring]).decode('utf-8').split("\n\n"):
+    stdout = popen([TMUX] + command.split(' ') + ["-F", fstring])
+    for item in stdout.split("\n\n"):
         if item == "":
             return
-        item = item.split('\n')
-        s = Storage()
-        for i in range(0, len(fields)):
-            s.__dict__[fields[i]] = item[i]
-        yield s
+
+        yield namedtuple("FieldsType", fields)(*item.split('\n'))
 
 
 def tmux_get_sessions():
-    procs = ps()
+    """
+    Queries tmux for the currently-running sessions.
+
+    @returns:
+        A list of SessionInfo items.
+    """
+
+    procs = list_processes()
 
     sessions = {}
-    for session in tmux_get("list-sessions", ["session_name", "session_created", "session_width", "session_height"]):
-        s = Storage(name=session.session_name)
-        s.created = int(session.session_created)
-        s.w = int(session.session_width)
-        s.h = int(session.session_height)
-        s.dims = session.session_width + "x" + session.session_height
-        s.fgprocs = []
-        s.users = dict()
-        s.usr_blame_w = None
-        s.usr_blame_h = None
-        s.usr_most_recent = None
-        sessions[s.name] = s
+    # retrieve basic session list
+    for session in tmux_get("list-sessions", ["session_name",
+                                              "session_created",
+                                              "session_width",
+                                              "session_height"]):
 
+        session_info = SimpleNamespace()
+
+        session_info.name = session.session_name
+        session_info.created = int(session.session_created)
+        session_info.w = int(session.session_width),
+        session_info.h = int(session.session_height),
+        session_info.dims = (session.session_width + "x" +
+                             session.session_height)
+        session_info.fgprocs = []
+        session_info.users = {}
+        session_info.usr_blame_w = session_info.usr_blame_h = None
+        session_info.usr_most_recent = None
+
+        sessions[session_info.name] = session_info
+
+    # retrieve info on foreground process
     for pane in tmux_get("list-panes -a", ["session_name", "pane_pid"]):
-        s = sessions[pane.session_name]
+        session_info = sessions[pane.session_name]
         pid = int(pane.pane_pid)
         try:
-            fgpg = procs[pid].fgpg
+            fgpgroup = procs[pid].fgpgroup
             for pid in procs:
-                if procs[pid].pg == fgpg:
-                    s.fgprocs.append(procs[pid])
-        except:
+                if procs[pid].pgroup == fgpgroup:
+                    session_info.fgprocs.append(procs[pid])
+        except KeyError:
+            # advertised process doesn't exist
             pass
 
-    for client in tmux_get("list-clients", ["session_name", "client_activity", "client_tty", "client_width", "client_height"]):
-        s = sessions[client.session_name]
+    # retrieve info on connected clients
+    for client in tmux_get("list-clients", ["session_name",
+                                            "client_activity",
+                                            "client_tty",
+                                            "client_width",
+                                            "client_height"]):
+
+        session_info = sessions[client.session_name]
 
         # the user name is the owner of the pts
         uname = pwd.getpwuid(os.stat(client.client_tty).st_uid).pw_name
-        activity = int(client.client_activity)
-        w = int(client.client_width)
-        h = int(client.client_height)
-        if uname not in s.users:
-            usr = Storage()
-            usr.w = w
-            usr.h = h
-            usr.activity = activity
-            s.users[uname] = usr
+        last_activity = int(client.client_activity)
+        client_width = int(client.client_width)
+        client_height = int(client.client_height)
+        if uname not in session_info.users:
+            usr = SimpleNamespace()
+
+            usr.w = client_width,
+            usr.h = client_height,
+            usr.last_activity = last_activity
+
+            session_info.users[uname] = usr
         else:
-            usr = s.users[uname]
-            usr.w = min(w, usr.w)
-            usr.h = min(h, usr.h)
-            usr.activity = max(activity, usr.activity)
+            usr = session_info.users[uname]
+            usr.w = min(client_width, usr.w)
+            usr.h = min(client_height, usr.h)
+            usr.last_activity = max(last_activity, usr.last_activity)
 
         # check which user is to blame for the terminal size constraints,
         # and who was most recently active
-        if usr.w == s.w:
-            s.usr_blame_w = usr
-        if usr.h == s.h:
-            s.usr_blame_h = usr
-        if s.usr_most_recent is None:
-            s.usr_most_recent = usr
+        if usr.w == session_info.w:
+            session_info.usr_blame_w = usr
+        if usr.h == session_info.h:
+            session_info.usr_blame_h = usr
+        if session_info.usr_most_recent is None:
+            session_info.usr_most_recent = usr
         else:
-            if usr.activity > s.usr_most_recent.activity:
-                s.usr_most_recent = usr
+            if usr.last_activity > session_info.usr_most_recent.last_activity:
+                session_info.usr_most_recent = usr
 
-    return [sessions[session] for session in sessions]
+    return list(sessions.values())
 
 
 def tmux_attach_session(name):
-    return subprocess.call([tmux, "attach-session", "-t", name]) == 0
+    """
+    Attaches to the running session with the given name.
+    """
+    return subprocess.call([TMUX, "attach-session", "-t", name]) == 0
 
 
 def tmux_create_session(name):
-    return subprocess.call([tmux, "new-session", "-s", name]) == 0
+    """
+    Creates a new session with the given name.
+    """
+    return subprocess.call([TMUX, "new-session", "-s", name]) == 0
 
 
 class Completer:
+    """
+    Readline completer for available tmux sessions.
+    """
+    # pylint: disable=too-few-public-methods
+
     def __init__(self, sessions):
         self.sessions = [s.name for s in sessions]
 
+        # caches the list of completion options.
+        self.cache = []
+
     def __call__(self, text, status):
         if status == 0:
-            self.available = [s for s in self.sessions if s.startswith(text)]
+            self.cache = [s for s in self.sessions if s.startswith(text)]
 
         try:
-            return self.available[status]
-        except:
+            return self.cache[status]
+        except IndexError:
             return None
 
 
-def date_to_str(d):
-    t = round(time.time())
-    localtime = time.localtime(d)
-    dt = t - d
-    if dt < 10:
+def date_to_str(date):
+    """
+    Very-human-readable date-to-string function.
+    """
+    deltatime = round(time.time()) - date
+    localtime = time.localtime(date)
+
+    if deltatime < 10:
         return "just now"
-    elif dt < 60:
+    elif deltatime < 60:
         return "last min"
-    elif dt < (3600 * 12):
+    elif deltatime < (3600 * 12):
         return time.strftime("%H:%M", localtime)
     else:
         return time.strftime("%Y-%m-%d %H:%M", localtime)
 
 
+def print_shiny_session_table(sessions):
+    """
+    Prints a shiny table of the given sessions.
+    """
+    table = Table(minrowh=1, maxrowh=10)
+
+    table.add_col(Column(
+        "name",
+        minw=10))
+
+    table.add_col(Column(
+        "dims",
+        lambda session: (session.dims, ALIGN_RIGHT),
+        minw=6))
+
+    table.add_col(Column(
+        "created",
+        lambda session: (date_to_str(session.created), ALIGN_RIGHT),
+        minw=16))
+
+    table.add_col(Column(
+        "last active",
+        lambda session: "" if session.usr_most_recent is None else None,
+        lambda session: (date_to_str(session.usr_most_recent.last_activity),
+                         ALIGN_RIGHT),
+        minw=16))
+
+    table.add_col(Column(
+        "users",
+        lambda session: (
+            (x, ALIGN_RIGHT) for x in
+            sorted(session.users,
+                   key=lambda x: -session.users[x].last_activity)),
+        minw=8))
+
+    table.add_col(Column(
+        "fg processes",
+        lambda session: [p.cmdline for p in session.fgprocs]))
+
+    for session in sessions:
+        table.add_row(session)
+
+    table.print()
+
+
 def loop():
-    # gather information about running sessions
+    """
+    One iteration of the main loop.
+
+    Gathers information, queries the user for input, and responds accordingly.
+    """
+    # pylint: disable=broad-except
     try:
         sessions = tmux_get_sessions()
-    except:
+    except RuntimeError as ex:
         sessions = []
+        print(ex)
+    except Exception:
+        import traceback
+        print("Error while retrieving session list:")
+        traceback.print_exc()
+
+    print("Running TMUX sessions:\n")
+    print_shiny_session_table(sessions)
 
     readline.set_completer(Completer(sessions))
 
-    # display the gathered information
-    print("Running TMUX sessions:\n")
-    t = Table(minrowh=1, maxrowh=10)
-    t.add_col("name", minw=10)
-    t.add_col("dims", lambda session: (session.dims, Table.align_right), minw=6)
-    t.add_col("created", lambda session: (date_to_str(session.created), Table.align_right), minw=16)
-    t.add_col("last active", lambda session: (date_to_str(session.usr_most_recent.activity), Table.align_right), None, minw=16)
-    t.add_col("users", lambda session: ((x, Table.align_right) for x in sorted(session.users, key=lambda x: -session.users[x].activity)), minw=8)
-    t.add_col("fg processes", lambda session: [p.cmdline for p in session.fgprocs])
-    for session in sessions:
-        t.add_row(session)
-    t.print()
-    print("\nType the name of an existing or new session, or press ENTER to spawn a shell.")
+    print("\n"
+          "Type the name of an existing or new session, "
+          "or press ENTER to spawn a shell.")
 
     line = input("> ")
     if not line:
         print("Spawning shell")
-        subprocess.call([shell])
+        subprocess.call([SHELL])
         return
 
     if line in (s.name for s in sessions):
